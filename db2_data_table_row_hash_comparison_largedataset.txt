@@ -1,0 +1,173 @@
+# DB2 Connection Parameters
+$DB2Server  = "10.160.130.68"
+$DB2Database = "MCQV1F0A"
+$DB2User    = "db2admin"
+$DB2Password = "L8Gr8twO"
+
+# Output Directory
+$OutputDir = "K:\Hash_MCQV1F0A\MCQV1F0A_FMO"
+$SummaryFile = "$OutputDir\Execution_Summary_MCQV1F0A_FMO.txt"
+
+# Create Output Directory if it doesn't exist
+if (!(Test-Path -Path $OutputDir)) { 
+    New-Item -ItemType Directory -Path $OutputDir -Force 
+}
+
+# Table Queries File
+$QueryFilePath = "K:\Hash_MCQV1F0A\TableQueries.txt"
+
+# Initialize Table Queries Hashtable
+$TableQueries = @{}
+
+# Read and Process Table Queries File
+if (Test-Path -Path $QueryFilePath) {
+    $TableData = Get-Content -Path $QueryFilePath
+    foreach ($line in $TableData) {
+        if ($line.Trim() -eq "") { continue }
+        $parts = $line -split "~\|\~", 2
+        if ($parts.Count -eq 2) {
+            $tableName = $parts[0].Trim()
+            $query = $parts[1]
+            if ($tableName -ne "" -and $query -ne "") {
+                $TableQueries[$tableName] = $query
+            }
+        }
+    }
+} else {
+    Write-Host "Table query file not found: $QueryFilePath"
+    exit
+}
+
+# Get Maximum Available CPU Cores
+$MaxParallelJobs = [System.Environment]::ProcessorCount
+Write-Host "Using $MaxParallelJobs CPU cores for parallel execution."
+
+# Create ODBC Connection String
+$ConnString = "Driver={IBM DB2 ODBC DRIVER};Hostname=$DB2Server;Database=$DB2Database;Uid=$DB2User;Pwd=$DB2Password;"
+
+# Initialize Execution Summary
+$ExecutionSummary = @()
+$ExecutionSummary += "DB2 Data Extraction Summary"
+$ExecutionSummary += "==========================="
+$ExecutionSummary += "Database: $DB2Database"
+$ExecutionSummary += "Server: $DB2Server"
+$ExecutionSummary += "Total Tables: $($TableQueries.Count)"
+$ExecutionSummary += "Execution Start Time: $(Get-Date)"
+$ExecutionSummary += ""
+
+# Parallel Execution - Start Jobs
+$Jobs = @()
+foreach ($table in $TableQueries.GetEnumerator()) {
+    $tableName = $table.Key
+    $Query = $table.Value
+
+    $Job = Start-Job -ScriptBlock {
+        param ($ConnString, $tableName, $Query, $OutputDir)
+
+        try {
+            # Open DB2 Connection
+            $dbConnection = New-Object System.Data.Odbc.OdbcConnection
+            $dbConnection.ConnectionString = $ConnString
+            $dbConnection.Open()
+
+            # Execute Query
+            $command = $dbConnection.CreateCommand()
+            $command.CommandText = $Query
+            $adapter = New-Object System.Data.Odbc.OdbcDataAdapter($command)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset)
+
+            $rowCount = $dataset.Tables[0].Rows.Count
+            if ($rowCount -eq 0) {
+                return "Table: $tableName | No data returned | Hash Skipped"
+            }
+
+            # Create new table with modified column types
+            $newTable = New-Object System.Data.DataTable
+            foreach ($col in $dataset.Tables[0].Columns) {
+                if ($col.ColumnName -eq "ROW_HASH") {
+                    $newColumn = New-Object System.Data.DataColumn $col.ColumnName, ([string])
+                } else {
+                    $newColumn = New-Object System.Data.DataColumn $col.ColumnName, ($col.DataType)
+                }
+                $newTable.Columns.Add($newColumn)
+            }
+
+            # Convert and insert rows without eliminating any data
+            foreach ($row in $dataset.Tables[0].Rows) {
+                $newRow = $newTable.NewRow()
+                foreach ($col in $dataset.Tables[0].Columns) {
+                    $value = $row[$col.ColumnName]
+                    if ($col.ColumnName -eq "ROW_HASH" -and $value -is [System.Byte[]] -and $value.Length -gt 0) {
+                        $newRow[$col.ColumnName] = [BitConverter]::ToString($value) -replace '-', ''
+                    } else {
+                        $newRow[$col.ColumnName] = $value
+                    }
+                }
+                $newTable.Rows.Add($newRow)
+            }
+
+            # Ensure CSV export preserves all rows
+            $CSVFile = "$OutputDir\DB2_Export_$tableName.csv"
+            $newTable | Sort-Object ROW_HASH | ConvertTo-Csv -NoTypeInformation | Out-File -FilePath $CSVFile -Encoding utf8
+
+            # Compute Static Hash for CSV in chunks (Chunk Size: 16MB)
+            if (Test-Path -Path $CSVFile) {
+                $hashAlgorithm = [System.Security.Cryptography.SHA256]::Create()
+                $stream = [System.IO.File]::OpenRead($CSVFile)
+
+                $bufferSize = 16MB  # Increased buffer size to 16MB
+                $buffer = New-Object byte[] $bufferSize
+
+                while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $hashAlgorithm.TransformBlock($buffer, 0, $bytesRead, $buffer, 0) | Out-Null
+                }
+
+                $hashAlgorithm.TransformFinalBlock($buffer, 0, 0) | Out-Null
+                $HashValue = [BitConverter]::ToString($hashAlgorithm.Hash) -replace "-", ""
+
+                # Save Hash Value to a File
+                $HashFile = "$OutputDir\DB2_Export_Hash_$tableName.txt"
+                $HashValue | Out-File -FilePath $HashFile -Encoding UTF8
+
+                # Return execution summary
+                return "Table: $tableName | Hash: $HashValue | Rows: $rowCount"
+            } else {
+                return "Table: $tableName | Hash: ERROR | CSV Missing"
+            }
+        } catch {
+            return "Table: $tableName | ERROR: $_.Exception.Message"
+        }
+    } -ArgumentList $ConnString, $tableName, $Query, $OutputDir
+
+    $Jobs += $Job
+}
+
+# Monitor Jobs with CPU Utilization Control
+Write-Host "Waiting for parallel jobs to finish..."
+$RunningJobs = $Jobs.Count
+while ($RunningJobs -gt 0) {
+    Start-Sleep -Seconds 5
+    $RunningJobs = ($Jobs | Where-Object { $_.State -eq 'Running' }).Count
+}
+
+# Collect Execution Results
+foreach ($Job in $Jobs) {
+    $result = Receive-Job -Job $Job
+    if ($result) {
+        $ExecutionSummary += $result
+        Write-Host $result
+    }
+    Remove-Job -Job $Job
+}
+
+# Append Execution End Time
+$ExecutionSummary += ""
+$ExecutionSummary += "Execution End Time: $(Get-Date)"
+$ExecutionSummary += "==========================="
+
+# Save Execution Summary to File
+$ExecutionSummary -join "`n" | Out-File -FilePath $SummaryFile -Encoding UTF8
+Write-Host "Execution summary saved to $SummaryFile"
+Write-Host "Script execution completed."
+Write-Host "Check the output CSV files and summary in $OutputDir"

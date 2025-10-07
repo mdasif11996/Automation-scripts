@@ -1,0 +1,174 @@
+# DB2 Connection Parameters
+$DB2Server  = "10.160.133.68"
+$DB2Database = "MCN0A"
+$DB2User    = "appadmin"
+$DB2Password = "@dminAPP"
+
+# Output Directory
+$OutputDir = "K:\DB2_Exports\Table_Level_Hashes\FMO1"
+$SummaryFile = "$OutputDir\Execution_Summary.txt"
+
+# Create Output Directory if it doesn't exist
+if (!(Test-Path -Path $OutputDir)) { 
+    New-Item -ItemType Directory -Path $OutputDir -Force 
+}
+
+# Table Queries File
+$QueryFilePath = "K:\DB2_Exports\Table_Level_Hashes\TableQueries.txt"
+
+# Initialize Table Queries Hashtable
+$TableQueries = @{}
+
+# Read and Process Table Queries File
+if (Test-Path -Path $QueryFilePath) {
+    $TableData = Get-Content -Path $QueryFilePath
+
+    foreach ($line in $TableData) {
+        # Skip empty lines
+        if ($line.Trim() -eq "") { continue }
+
+        # Use '~|~' as a unique delimiter to split only once at the first occurrence
+        $parts = $line -split "~\|\~", 2
+
+        if ($parts.Count -eq 2) {
+            $tableName = $parts[0].Trim()  # Trim only table name
+            $query = $parts[1]  # Keep query unmodified
+
+            if ($tableName -ne "" -and $query -ne "") {
+                $TableQueries[$tableName] = $query
+            } else {
+                Write-Host "Skipping invalid entry: $line"
+            }
+        } else {
+            Write-Host "Skipping malformed line: $line"
+        }
+    }
+} else {
+    Write-Host "Table query file not found: $QueryFilePath"
+    exit
+}
+
+# Debugging: Print extracted table-query pairs
+Write-Host "Extracted Table Queries:"
+$TableQueries.GetEnumerator() | ForEach-Object { Write-Host "Table: $($_.Key) | Query: $($_.Value)" }
+
+# Create ODBC Connection String
+$ConnString = "Driver={IBM DB2 ODBC DRIVER};Hostname=$DB2Server;Database=$DB2Database;Uid=$DB2User;Pwd=$DB2Password;"
+
+# Initialize Execution Summary
+$ExecutionSummary = @()
+$ExecutionSummary += "DB2 Data Extraction Summary"
+$ExecutionSummary += "==========================="
+$ExecutionSummary += "Database: $DB2Database"
+$ExecutionSummary += "Server: $DB2Server"
+$ExecutionSummary += "Total Tables: $($TableQueries.Count)"
+$ExecutionSummary += "Execution Start Time: $(Get-Date)"
+$ExecutionSummary += ""
+
+try {
+    # Open DB2 Connection
+    $dbConnection = New-Object System.Data.Odbc.OdbcConnection
+    $dbConnection.ConnectionString = $ConnString
+    $dbConnection.Open()
+    Write-Host "Connected to DB2 database: $DB2Database"
+    $ExecutionSummary += "Connection Status: SUCCESS"
+
+    foreach ($table in $TableQueries.GetEnumerator()) {
+        $tableName = $table.Key
+        $Query = $table.Value
+        Write-Host "Executing query for table: $tableName"
+
+        try {
+            # Execute Query
+            $command = $dbConnection.CreateCommand()
+            $command.CommandText = $Query
+            $adapter = New-Object System.Data.Odbc.OdbcDataAdapter($command)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset)
+
+            $rowCount = $dataset.Tables[0].Rows.Count
+            $ExecutionSummary += "Table: $tableName | Row Count: $rowCount"
+
+            if ($rowCount -gt 0) {
+                Write-Host "Data retrieved for table: $tableName"
+
+                # Create new table with modified column types
+                $newTable = New-Object System.Data.DataTable
+                foreach ($col in $dataset.Tables[0].Columns) {
+                    if ($col.ColumnName -eq "ROW_HASH") {
+                        $newColumn = New-Object System.Data.DataColumn $col.ColumnName, ([string])
+                    } else {
+                        $newColumn = New-Object System.Data.DataColumn $col.ColumnName, ($col.DataType)
+                    }
+                    $newTable.Columns.Add($newColumn)
+                }
+
+                # Convert and insert rows
+                foreach ($row in $dataset.Tables[0].Rows) {
+                    $newRow = $newTable.NewRow()
+                    foreach ($col in $dataset.Tables[0].Columns) {
+                        $value = $row[$col.ColumnName]
+                        if ($col.ColumnName -eq "ROW_HASH" -and $value -is [System.Byte[]] -and $value.Length -gt 0) {
+                            $newRow[$col.ColumnName] = [BitConverter]::ToString($value) -replace '-', ''
+                        } else {
+                            $newRow[$col.ColumnName] = $value
+                        }
+                    }
+                    $newTable.Rows.Add($newRow)
+                }
+
+                # Export sorted data to CSV
+                $CSVFile = "$OutputDir\DB2_Export_$tableName.csv"
+                $newTable | Sort-Object ROW_HASH | Export-Csv -Path $CSVFile -NoTypeInformation -Encoding UTF8
+                Write-Host "Exported sorted data to $CSVFile"
+
+                # Compute Static Hash for CSV
+                if (Test-Path -Path $CSVFile) {
+                    $CSVContent = (Get-Content -Path $CSVFile | Select-Object -Skip 1 | Sort-Object) -join "`n"
+                    $CSVContent = $CSVContent -replace '\s+$', ''  # Trim trailing spaces
+
+                    # Compute SHA-256 Hash
+                    $HashObject = New-Object System.Security.Cryptography.SHA256Managed
+                    $HashBytes = $HashObject.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($CSVContent))
+                    $HashValue = [BitConverter]::ToString($HashBytes) -replace "-", ""
+
+                    # Save Hash Value to a File
+                    $HashFile = "$OutputDir\DB2_Export_Hash_$tableName.txt"
+                    $HashValue | Out-File -FilePath $HashFile -Encoding UTF8
+                    Write-Host "Hash saved in $HashFile"
+
+                    # Append to Execution Summary
+                    $ExecutionSummary += "Table: $tableName | Hash: $HashValue | Hash File: $HashFile"
+                } else {
+                    Write-Host "CSV file not found for hashing."
+                    $ExecutionSummary += "Table: $tableName | Hash: ERROR | CSV Missing"
+                }
+            } else {
+                Write-Host "No data returned for table: $tableName"
+            }
+        } catch {
+            Write-Host "Error executing query for table: $tableName"
+            Write-Host $_.Exception.Message
+            $ExecutionSummary += "Table: $tableName | ERROR: $_.Exception.Message"
+        }
+    }
+
+    # Close the database connection
+    $dbConnection.Close()
+} catch {
+    Write-Host "Error connecting to DB2 database: $DB2Database"
+    Write-Host $_.Exception.Message
+    $ExecutionSummary += "Connection Status: FAILED | ERROR: $_.Exception.Message"
+}
+
+# Append Execution End Time
+$ExecutionSummary += ""
+$ExecutionSummary += "Execution End Time: $(Get-Date)"
+$ExecutionSummary += "==========================="
+
+# Save Execution Summary to File
+$ExecutionSummary -join "`n" | Out-File -FilePath $SummaryFile -Encoding UTF8
+Write-Host "Execution summary saved to $SummaryFile"
+
+Write-Host "Script execution completed."
+Write-Host "Check the output CSV files and summary in $OutputDir"
